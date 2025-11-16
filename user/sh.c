@@ -1,8 +1,7 @@
-// Shell.
-
 #include "kernel/types.h"
 #include "user/user.h"
 #include "kernel/fcntl.h"
+#include "kernel/param.h"  
 
 // Parsed command representation
 #define EXEC  1
@@ -12,6 +11,10 @@
 #define BACK  5
 
 #define MAXARGS 10
+
+
+int jobs[NPROC];
+int njobs = 0;  
 
 struct cmd {
   int type;
@@ -54,12 +57,17 @@ void panic(char*);
 struct cmd *parsecmd(char*);
 void runcmd(struct cmd*) __attribute__((noreturn));
 
-// Execute cmd.  Never returns.
+
+void add_job(int pid);
+void remove_job(int pid);
+void print_jobs(void);
+
+
 void
 runcmd(struct cmd *cmd)
 {
   int p[2];
-  struct backcmd *bcmd;
+  //struct backcmd *bcmd;
   struct execcmd *ecmd;
   struct listcmd *lcmd;
   struct pipecmd *pcmd;
@@ -78,7 +86,7 @@ runcmd(struct cmd *cmd)
       exit(1);
     exec(ecmd->argv[0], ecmd->argv);
     fprintf(2, "exec %s failed\n", ecmd->argv[0]);
-    break;
+    exit(0);  
 
   case REDIR:
     rcmd = (struct redircmd*)cmd;
@@ -122,11 +130,6 @@ runcmd(struct cmd *cmd)
     wait(0);
     break;
 
-  case BACK:
-    bcmd = (struct backcmd*)cmd;
-    if(fork1() == 0)
-      runcmd(bcmd->cmd);
-    break;
   }
   exit(0);
 }
@@ -134,42 +137,174 @@ runcmd(struct cmd *cmd)
 int
 getcmd(char *buf, int nbuf)
 {
-  write(2, "$ ", 2);
   memset(buf, 0, nbuf);
   gets(buf, nbuf);
-  if(buf[0] == 0) // EOF
+  if(buf[0] == 0) 
     return -1;
   return 0;
 }
 
 int
-main(void)
+main(int argc, char *argv[])
 {
   static char buf[100];
   int fd;
+  int script_fd = -1; 
 
-  // Ensure that three file descriptors are open.
-  while((fd = open("console", O_RDWR)) >= 0){
-    if(fd >= 3){
-      close(fd);
-      break;
+  for(int i = 0; i < NPROC; i++)
+    jobs[i] = 0;
+
+  if(argc > 1){
+    script_fd = open(argv[1], O_RDONLY);
+    if(script_fd < 0){
+      fprintf(2, "sh: cannot open %s\n", argv[1]);
+      exit(1);
+    }
+   
+    close(0);
+    dup(script_fd);
+    close(script_fd);
+  } else {
+    while((fd = open("console", O_RDWR)) >= 0){
+      if(fd >= 3){
+        close(fd);
+        break;
+      }
     }
   }
 
+  int status;
+  int pid;
+  int has_background = 0;  
+  int interactive = (argc == 1);  
+
   // Read and run input commands.
-  while(getcmd(buf, sizeof(buf)) >= 0){
+  while(1){
+
+    while ((pid = wait_noblock(&status)) > 0){
+      if (interactive)
+        printf("[bg %d] exited with status %d\n", pid, status);
+      remove_job(pid);  
+      has_background = 0;  
+    }
+
+  
+    if(has_background && interactive){
+      sleep(1);
+      while ((pid = wait_noblock(&status)) > 0){
+        if (interactive)
+          printf("[bg %d] exited with status %d\n", pid, status);
+        remove_job(pid);  
+        has_background = 0;
+      }
+    }
+
+  
+    if(interactive)
+      write(2, "$ ", 2);
+
+    // read input
+    if(getcmd(buf, sizeof(buf)) < 0)
+      break;
+
+    // AFTER inputting command: poll again
+    while ((pid = wait_noblock(&status)) > 0){
+      if(interactive)
+        printf("[bg %d] exited with status %d\n", pid, status);
+      remove_job(pid); 
+      has_background = 0;
+    }
+
     if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
       // Chdir must be called by the parent, not the child.
-      buf[strlen(buf)-1] = 0;  // chop \n
+      buf[strlen(buf)-1] = 0;  
       if(chdir(buf+3) < 0)
         fprintf(2, "cannot cd %s\n", buf+3);
       continue;
     }
-    if(fork1() == 0)
-      runcmd(parsecmd(buf));
-    wait(0);
+    
+    if(buf[0] == 'j' && buf[1] == 'o' && buf[2] == 'b' && buf[3] == 's' && 
+       (buf[4] == '\n' || buf[4] == 0)){
+      print_jobs();
+      continue;
+    }
+    struct cmd *cmd_ptr = parsecmd(buf);
+
+    if(cmd_ptr->type == BACK){
+      struct backcmd *bcmd = (struct backcmd*)cmd_ptr;
+
+      int child = fork1();
+      if(child == 0)
+        runcmd(bcmd->cmd);
+
+      printf("[%d]\n", child);
+      add_job(child);  
+      has_background = 1;  
+      continue;
+    }
+
+    // foreground
+    int child = fork1();
+    if(child == 0)
+      runcmd(cmd_ptr);
+
+    int wpid;
+    while((wpid = wait(&status)) > 0){
+      if(wpid == child){
+        break;
+      } else {
+        printf("[bg %d] exited with status %d\n", wpid, status);
+        remove_job(wpid); 
+        has_background = 0;
+      }
+    }
+  }
+
+  if (!interactive) {
+    while (njobs > 0) {
+      int wpid = wait(&status);
+      if (wpid > 0) {
+        remove_job(wpid); 
+      } else if (wpid == -1) {
+        break; 
+      }
+    }
   }
   exit(0);
+}
+
+void
+add_job(int pid)
+{
+  for(int i = 0; i < NPROC; i++){
+    if(jobs[i] == 0){
+      jobs[i] = pid;
+      njobs++;
+      return;
+    }
+  }
+}
+
+void
+remove_job(int pid)
+{
+  for(int i = 0; i < NPROC; i++){
+    if(jobs[i] == pid){
+      jobs[i] = 0;
+      njobs--;
+      return;
+    }
+  }
+}
+
+void
+print_jobs(void)
+{
+  for(int i = 0; i < NPROC; i++){
+    if(jobs[i] != 0){
+      printf("%d\n", jobs[i]);
+    }
+  }
 }
 
 void
@@ -192,7 +327,6 @@ fork1(void)
 
 //PAGEBREAK!
 // Constructors
-
 struct cmd*
 execcmd(void)
 {
